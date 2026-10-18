@@ -28,6 +28,14 @@ within noise: six extra layers on the fastest, non-bottleneck card are a few mil
 server on this layout; see `FINDINGS-serving-economics.md` for why that number is not 110 ms). Prefill, being compute-bound,
 would pay the full ~15 % for six of forty layers.
 
+**Prior art.** Re-running or reordering the middle layers of a frozen pretrained transformer without training was studied by
+Sun, Pickett, Nain and Jones, *Transformer Layers as Painters* (AAAI 2025, arXiv:2407.09298), on Llama 2 and BERT: middle
+layers share a representation space, looped and reordered execution degrade benchmarks the least, repeating a single layer
+hurts most, and the overall trade is accuracy for latency. Our prior from that work is that a looped window scores slightly
+worse, not better; what is new here is the architecture (hyper-connections and cross-layer KV sharing decide where a loop is
+legal), the cost model on a heterogeneous fleet (free when the window sits on the idle fast card), the damped blend as a dial,
+and the model size.
+
 **What we do not know yet.** Whether the looped answers are better. One exhibit: on the photoinitiator question the control
 says doubling the initiator *deepens* cure and then hedges, the looped answer commits to the opposite, shallower cure by
 Beer-Lambert, which is the textbook direction for an initiator-limited inner-filter regime. Perplexity and a 30-prompt judged
