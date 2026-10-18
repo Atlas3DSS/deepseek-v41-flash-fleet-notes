@@ -1,3 +1,13 @@
+---
+license: mit
+tags:
+- deepseek
+- llama.cpp
+- inference
+- interpretability
+- notes
+pretty_name: DeepSeek-V4.1-Flash fleet notes
+---
 # DeepSeek-V4.1-Flash on a heterogeneous llama.cpp fleet — notes and patches
 
 Working notes from serving DeepSeek-V4.1-Flash-1017 at its native Q8_0/MXFP4 precision across four machines
@@ -18,6 +28,8 @@ Working notes from serving DeepSeek-V4.1-Flash-1017 at its native Q8_0/MXFP4 pre
 Headline numbers on this fleet, same model file throughout: 1.3 tok/s (naive layer split) -> 3.9 (device boundaries
 aligned to the KV-sharing groups) -> 9.5 (per-device replicas) -> 9.3-10 (kernel + decode fixes). Everything outside VRAM
 (15 expert layers in RAM) is what remains; six V100s arriving this week should remove it.
+
+Mirror: https://huggingface.co/datasets/Atlas3D/deepseek-v41-flash-fleet-notes
 
 Credits: Atlas3DSS (owner, direction, hardware); Claude (Anthropic) did the measurement, engine work and writing in this
 shop; Astra (OpenAI Codex) reviewed every patch; cliecy, nicholasshirley, smalinin, Mermiges and the PR #28696 authors
