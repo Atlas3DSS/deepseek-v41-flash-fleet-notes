@@ -1,0 +1,392 @@
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index 1140aa5..1ea3915 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -408,6 +408,12 @@ static void dsv4_state_read_k_cache(
+         }
+ 
+         dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
++
++        // multi-device replicas of this storage layer hold the same rows: refresh them from the owner
++        const auto copies = kv->get_k_storage_all(il);
++        for (size_t i = 1; i < copies.size(); ++i) {
++            ggml_backend_tensor_copy(copies[0], copies[i]);
++        }
+     }
+ }
+ 
+@@ -1850,7 +1856,9 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+             if (data) {
+                 //TODO: do not clear the kv-cache during `seq_rm`, ref: https://github.com/ggml-org/llama.cpp/pull/26490#discussion_r3798143663
+                 for (uint32_t il : kv->get_layer_ids()) {
+-                    dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
++                    for (ggml_tensor * t : kv->get_k_storage_all(il)) { // owner and its multi-device replicas
++                        dsv4_clear_tensor_stream(t, (uint32_t) seq_id);
++                    }
+                 }
+             }
+         };
+@@ -2098,6 +2106,10 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_t
+     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+ }
+ 
++std::vector<ggml_tensor *> llama_kv_cache_dsv4_comp_context::cpy_k_extra(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
++    return kv->cpy_k_extra(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
++}
++
+ ggml_tensor * llama_kv_cache_dsv4_comp_context::build_input_k_rot(ggml_context * ctx) const {
+     return kv->build_input_k_rot(ctx);
+ }
+diff --git a/src/llama-kv-cache-dsv4.h b/src/llama-kv-cache-dsv4.h
+index e692719..31739e5 100644
+--- a/src/llama-kv-cache-dsv4.h
++++ b/src/llama-kv-cache-dsv4.h
+@@ -258,6 +258,8 @@ public:
+ 
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
++    // replica writes for readers on other devices (see llama_kv_cache::cpy_k_extra)
++    std::vector<ggml_tensor *> cpy_k_extra(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+ 
+     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
+     void set_input_k_rot(ggml_tensor * dst) const;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index c09e4f0..fb1a74a 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -252,6 +252,9 @@ llama_kv_cache::llama_kv_cache(
+     if (reuse) {
+         LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);
+ 
++        // (owner KV layer id, reader buffer type) -> replica KV layer id, construction-time only
++        std::map<std::pair<int32_t, ggml_backend_buffer_type_t>, int32_t> replica_index;
++
+         for (uint32_t il = 0; il < n_layer; il++) {
+             const int32_t il_reuse = reuse(il);
+ 
+@@ -273,6 +276,77 @@ llama_kv_cache::llama_kv_cache(
+             map_layer_ids[il] = map_layer_ids[il_reuse];
+ 
+             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
++
++            // dsv41 2026-10-18: a reader on another device would otherwise pull the owner's whole cache view through
++            // the scheduler on every step (measured: the dominant per-token traffic for DeepSeek V4.1 over RPC).
++            // Give each reader device its own replica of the owner's tensors; cpy_k_extra/cpy_v_extra keep them
++            // in sync by writing the owner's new rows into every replica each step.
++            if (offload && (int32_t) il != il_reuse) {
++                // resolve the canonical owner: il_reuse may itself read a replica (chained reuse across devices)
++                int32_t ikv_owner = map_layer_ids[il_reuse];
++                {
++                    auto ro = replica_owner.find(ikv_owner);
++                    if (ro != replica_owner.end()) {
++                        ikv_owner = ro->second;
++                    }
++                }
++                // copy what we need from the owner entry: layers may reallocate when a replica is appended below
++                const uint32_t   il_owner = layers[ikv_owner].il;
++                ggml_tensor    * k_owner  = layers[ikv_owner].k;
++                ggml_tensor    * v_owner  = layers[ikv_owner].v;
++
++                ggml_backend_buffer_type_t buft_reader = ggml_backend_dev_buffer_type(model.dev_layer(il));
++                ggml_backend_buffer_type_t buft_owner  = ggml_backend_dev_buffer_type(model.dev_layer(il_owner));
++
++                if (buft_reader == buft_owner) {
++                    // chained reuse that lands back on the owner's device: read the owner itself, not the
++                    // intermediate reader's replica that map_layer_ids[il_reuse] may point at
++                    map_layer_ids[il] = ikv_owner;
++                } else {
++                    int32_t ikv_rep = -1;
++                    {
++                        auto key = std::make_pair(ikv_owner, buft_reader);
++                        auto found = replica_index.find(key);
++                        if (found != replica_index.end()) {
++                            ikv_rep = found->second;
++                        }
++                    }
++
++                    if (ikv_rep < 0) {
++                        ggml_context * ctx = ctx_for_buft(buft_reader);
++                        if (!ctx) {
++                            throw std::runtime_error("failed to create ggml context for kv cache replica");
++                        }
++
++                        const int rep_no = (int) replicas_of[ikv_owner].size();
++
++                        ggml_tensor * k = k_owner ? ggml_new_tensor_3d(ctx, k_owner->type, k_owner->ne[0], k_owner->ne[1], k_owner->ne[2]) : nullptr;
++                        ggml_tensor * v = v_owner ? ggml_new_tensor_3d(ctx, v_owner->type, v_owner->ne[0], v_owner->ne[1], v_owner->ne[2]) : nullptr;
++
++                        k && ggml_format_name(k, "cache_%sk_l%d_rep%d", name_tag, (int) il_owner, rep_no);
++                        v && ggml_format_name(v, "cache_%sv_l%d_rep%d", name_tag, (int) il_owner, rep_no);
++
++                        std::vector<ggml_tensor *> k_stream;
++                        std::vector<ggml_tensor *> v_stream;
++
++                        for (uint32_t s = 0; s < n_stream; ++s) {
++                            k_stream.push_back(k ? ggml_view_2d(ctx, k, k->ne[0], k->ne[1], k->nb[1], s*k->nb[2]) : nullptr);
++                            v_stream.push_back(v ? ggml_view_2d(ctx, v, v->ne[0], v->ne[1], v->nb[1], s*v->nb[2]) : nullptr);
++                        }
++
++                        ikv_rep = (int32_t) layers.size();
++                        layers.push_back({ il_owner, k, v, k_stream, v_stream, });
++                        replicas_of[ikv_owner].push_back(ikv_rep);
++                        replica_owner[ikv_rep] = ikv_owner;
++                        replica_index[std::make_pair(ikv_owner, buft_reader)] = ikv_rep;
++
++                        LLAMA_LOG_INFO("%s: - layer %3d: reuse layer %d on another device (%s) -> replica #%d allocated there\n",
++                                __func__, il, (int) il_owner, ggml_backend_dev_name(model.dev_layer(il)), rep_no);
++                    }
++
++                    map_layer_ids[il] = ikv_rep;
++                }
++            }
+         }
+     }
+ 
+@@ -1231,8 +1305,32 @@ std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
+     std::vector<uint32_t> res;
+     res.reserve(layers.size());
+ 
+-    for (const auto & layer : layers) {
+-        res.push_back(layer.il);
++    for (int32_t ikv = 0; ikv < (int32_t) layers.size(); ++ikv) {
++        if (replica_owner.find(ikv) != replica_owner.end()) {
++            continue; // physical copy of an owner listed already
++        }
++        res.push_back(layers[ikv].il);
++    }
++
++    return res;
++}
++
++std::vector<ggml_tensor *> llama_kv_cache::get_k_storage_all(int32_t il) const {
++    int32_t ikv = map_layer_ids.at(il);
++
++    auto ro = replica_owner.find(ikv);
++    if (ro != replica_owner.end()) {
++        ikv = ro->second;
++    }
++
++    std::vector<ggml_tensor *> res;
++    res.push_back(layers[ikv].k);
++
++    auto it = replicas_of.find(ikv);
++    if (it != replicas_of.end()) {
++        for (int32_t ikv_rep : it->second) {
++            res.push_back(layers[ikv_rep].k);
++        }
+     }
+ 
+     return res;
+@@ -1353,6 +1451,89 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
+     return ggml_set_rows(ctx, k, k_cur, k_idxs);
+ }
+ 
++std::vector<ggml_tensor *> llama_kv_cache::cpy_k_extra(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
++    std::vector<ggml_tensor *> res;
++
++    int32_t ikv = map_layer_ids.at(il);
++    if (auto ro = replica_owner.find(ikv); ro != replica_owner.end()) {
++        ikv = ro->second;
++    }
++
++    auto it = replicas_of.find(ikv);
++    if (it == replicas_of.end()) {
++        return res;
++    }
++
++    for (int32_t ikv_rep : it->second) {
++        // same math as cpy_k, against the replica tensor
++        ggml_tensor * k = layers[ikv_rep].k;
++
++        const int64_t n_embd_head = k_cur->ne[0];
++        const int64_t n_head      = k_cur->ne[1];
++        const int64_t n_tokens    = k_cur->ne[2];
++
++        const int64_t n_embd_gqa = n_embd_head*n_head;
++
++        GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
++
++        ggml_tensor * k_cur_2d = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
++
++        const int64_t n_stream = k->ne[2];
++
++        if (n_stream > 1) {
++            k = ggml_reshape_2d(ctx, k, n_embd_gqa, get_size()*n_stream);
++        }
++
++        res.push_back(ggml_set_rows(ctx, k, k_cur_2d, k_idxs));
++    }
++
++    GGML_UNUSED(sinfo);
++    return res;
++}
++
++std::vector<ggml_tensor *> llama_kv_cache::cpy_v_extra(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
++    std::vector<ggml_tensor *> res;
++
++    int32_t ikv = map_layer_ids.at(il);
++    if (auto ro = replica_owner.find(ikv); ro != replica_owner.end()) {
++        ikv = ro->second;
++    }
++
++    auto it = replicas_of.find(ikv);
++    if (it == replicas_of.end()) {
++        return res;
++    }
++
++    // only the non-transposed (flash-attention) V layout is replicated; the transposed layout is not used by the
++    // DeepSeek V4.1 compressed caches this was written for
++    GGML_ASSERT(!v_trans && "KV replicas do not support the transposed V cache yet");
++
++    for (int32_t ikv_rep : it->second) {
++        ggml_tensor * v = layers[ikv_rep].v;
++
++        const int64_t n_embd_head = v_cur->ne[0];
++        const int64_t n_head      = v_cur->ne[1];
++        const int64_t n_tokens    = v_cur->ne[2];
++
++        const int64_t n_embd_gqa = n_embd_head*n_head;
++
++        GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
++
++        ggml_tensor * v_cur_2d = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
++
++        const int64_t n_stream = v->ne[2];
++
++        if (n_stream > 1) {
++            v = ggml_reshape_2d(ctx, v, n_embd_gqa, get_size()*n_stream);
++        }
++
++        res.push_back(ggml_set_rows(ctx, v, v_cur_2d, v_idxs));
++    }
++
++    GGML_UNUSED(sinfo);
++    return res;
++}
++
+ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+     GGML_UNUSED(sinfo);
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699..b190d86 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -163,8 +163,11 @@ public:
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
++    // distinct model layer ids that own storage in this cache (replicas are not listed)
+     std::vector<uint32_t> get_layer_ids() const;
+     ggml_tensor * get_k_storage(int32_t il) const;
++    // every physical copy of the storage layer il resolves to: the canonical owner first, then its replicas
++    std::vector<ggml_tensor *> get_k_storage_all(int32_t il) const;
+ 
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+ 
+@@ -193,6 +196,12 @@ public:
+     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+ 
++    // dsv41 2026-10-18 (multi-device shared layers): when a layer's KV is reused by layers that live on other devices,
++    // each such device holds a replica of the owner's cache. These return the extra set_rows nodes that write the same
++    // rows into every replica; the caller expands them next to the owner's cpy_k/cpy_v. Empty when there are none.
++    std::vector<ggml_tensor *> cpy_k_extra(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
++    std::vector<ggml_tensor *> cpy_v_extra(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
++
+     //
+     // preparation API
+     //
+@@ -313,6 +322,11 @@ private:
+     // model layer id -> KV cache layer id
+     std::unordered_map<int32_t, int32_t> map_layer_ids;
+ 
++    // owner KV cache layer id -> replica KV cache layer ids (same shape, other devices); see cpy_k_extra
++    std::unordered_map<int32_t, std::vector<int32_t>> replicas_of;
++    // replica KV cache layer id -> its canonical owner KV cache layer id
++    std::unordered_map<int32_t, int32_t> replica_owner;
++
+     size_t total_size() const;
+ 
+     size_t size_k_bytes() const;
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index d0521ce..8270478 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -599,6 +599,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
+         llm_graph_input_dsv4 * inp_dsv4,
+         ggml_tensor * cur,
+         ggml_tensor * inp_pos,
++        ggml_tensor * & top_k_carry,
+         int il) const {
+     const auto & layer = model.layers[il];
+     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+@@ -713,6 +714,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
+ 
+             ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(
+                         ctx0, idx_k, inp_comp.state_write_idxs, il));
++            for (ggml_tensor * t : inp_dsv4->mctx->get_lid()->cpy_k_extra(ctx0, idx_k, inp_comp.state_write_idxs, il)) {
++                ggml_build_forward_expand(gf, t); // replicas on other devices (multi-device shared index keys)
++            }
+         }
+ 
+         if (inp_dsv4->get_csa().k_rot) {
+@@ -722,6 +726,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
+ 
+         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(
+                     ctx0, latent, inp_comp.state_write_idxs, il));
++        for (ggml_tensor * t : inp_dsv4->mctx->get_csa()->cpy_k_extra(ctx0, latent, inp_comp.state_write_idxs, il)) {
++            ggml_build_forward_expand(gf, t); // replicas on other devices (multi-device shared compressed KV)
++        }
+ 
+         // carry whatever did not complete a row into the next ubatch
+         ggml_tensor * snapshot_kv    = ggml_concat(ctx0, restored.kv,    state_kv,    1);
+@@ -745,11 +752,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
+                     ctx0, persist_score, inp_comp.state_persist_dst_idxs, il));
+     }
+ 
+-    // an index source picks the positions; the layers in between reuse what it picked
+-    ggml_tensor * top_k = nullptr;
++    // an index source picks the positions; the layers in between reuse what it picked. Without the carry a reusing
++    // layer falls back to the full causal mask and attends to every compressed row, which matches the reference
++    // (inference/model.py Attention._compress_topk_idxs) only while a source holds <= index_topk rows.
++    // Fix from the PR #28696 review (nicholasshirley, 2026-09-28), applied locally 2026-10-17.
+     if (hparams.dsv41_is_index_source(il)) {
+-        top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
++        top_k_carry = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+     }
++    GGML_ASSERT(top_k_carry && "a compressed layer needs the top-k of an earlier index source");
++    ggml_tensor * top_k = top_k_carry;
+ 
+     ggml_tensor * k_rot = inp_attn->self_k_rot;
+     if (k_rot) {
+@@ -828,6 +839,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
+             ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
+     cb(pre_mix, "hc_pre_init", -1);
+ 
++    // the positions picked by the most recent index source, reused by the compressed layers that follow it
++    ggml_tensor * top_k_carry = nullptr;
++
+     for (int il = 0; il < n_layer; ++il) {
+         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
+@@ -859,7 +873,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
+         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
+-        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, il);
++        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, top_k_carry, il);
+ 
+         inpL = build_hc_post(cur, residual, post, comb, il);
+         cb(inpL, "hc_attn_post", il);
+diff --git a/src/models/models.h b/src/models/models.h
+index 7a88b99..ffc78fb 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1432,6 +1432,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
+                 llm_graph_input_dsv4 * inp_dsv4,
+                 ggml_tensor * cur,
+                 ggml_tensor * inp_pos,
++                ggml_tensor * & top_k_carry,
+                 int il) const;
+     };
+ 
