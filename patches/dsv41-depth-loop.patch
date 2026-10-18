@@ -1,0 +1,70 @@
+From 92b97d34db87d374ac6afad5075e0da2ecc8000d Mon Sep 17 00:00:00 2001
+From: Atlas3DSS <orwelian84@gmail.com>
+Date: Sun, 18 Oct 2026 13:55:20 -0700
+Subject: [PATCH] deepseek41: env-gated depth-loop experiment
+ (DSV41_LOOP=start-end:alpha), off by default
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/models/deepseek41.cpp | 38 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index 52f969f..77c9c53 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -987,7 +987,30 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
+     // the positions picked by the most recent index source, reused by the layers that follow it
+     ggml_tensor * top_k_carry = nullptr;
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    // Experiment (env DSV41_LOOP="start-end:alpha", default off): after layer `end` has run, run layers start..end a
++    // second time from the current stream and blend the result back as stream = p1 + alpha * (p2 - p1). Untrained
++    // depth recurrence; see experiments/dsv41-quincy PLAN (2026-10-18). Slices containing an engram layer are refused.
++    struct loop_cfg { bool on = false; int start = 0, end = -1; float alpha = 0.5f; };
++    static const loop_cfg loop = [&]() {
++        loop_cfg c; const char * e = getenv("DSV41_LOOP");
++        if (!e || !*e) return c;
++        int a = 0, b = -1; float al = 0.5f;
++        if (sscanf(e, "%d-%d:%f", &a, &b, &al) < 2 || a < 0 || b < a || b >= n_layer) {
++            LLAMA_LOG_WARN("%s: DSV41_LOOP='%s' not understood (want start-end:alpha), ignored\n", __func__, e);
++            return c;
++        }
++        for (int j = a; j <= b; ++j) {
++            if (pmodel.engram_index(j) >= 0) {
++                LLAMA_LOG_WARN("%s: DSV41_LOOP slice %d-%d contains engram layer %d, ignored\n", __func__, a, b, j);
++                return c;
++            }
++        }
++        c.on = true; c.start = a; c.end = b; c.alpha = al;
++        LLAMA_LOG_WARN("%s: DSV41_LOOP active: layers %d-%d run twice, alpha %.2f\n", __func__, a, b, al);
++        return c;
++    }();
++
++    auto run_layer = [&](int il) {
+         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
+             cb(res->t_layer_inp[il], "layer_inp", il);
+@@ -1076,6 +1099,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
+         inpL = build_hc_post(cur, residual, post, comb, il);
+         inpL = build_cvec(inpL, il);
+         cb(inpL, "l_last", il);
++    };
++
++    for (int il = 0; il < n_layer; ++il) {
++        run_layer(il);
++        if (loop.on && il == loop.end) {
++            ggml_tensor * p1 = inpL;
++            for (int j = loop.start; j <= loop.end; ++j) {
++                run_layer(j);
++            }
++            // damped second pass: p1 + alpha * (p2 - p1); the hyper-connection mix stays the pass-2 one
++            inpL = ggml_add(ctx0, p1, ggml_scale(ctx0, ggml_sub(ctx0, inpL, p1), loop.alpha));
++            cb(inpL, "loop_out", il);
++        }
+     }
+ 
+     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+-- 
+2.43.0
+

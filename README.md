@@ -34,3 +34,12 @@ Mirror: https://huggingface.co/datasets/Atlas3D/deepseek-v41-flash-fleet-notes
 Credits: Atlas3DSS (owner, direction, hardware); Claude (Anthropic) did the measurement, engine work and writing in this
 shop; Astra (OpenAI Codex) reviewed every patch; cliecy, nicholasshirley, smalinin, Mermiges and the PR #28696 authors
 for the pieces we built on. MIT, like llama.cpp.
+
+## Added 2026-10-18 (evening)
+
+- [FINDINGS-depth-loop.md](FINDINGS-depth-loop.md): running layers 30-35 a second time at inference, with controls; free in
+  decode time on our layout, outputs diverge, quality scoring in progress. Patch: `patches/dsv41-depth-loop.patch`; raw
+  sample answers: `quality/depth-loop-sample/`.
+- [FINDINGS-serving-economics.md](FINDINGS-serving-economics.md): thinking vs best-of-N wall time at ~9 tok/s, why parallel
+  decode does not scale with CPU-resident experts, per-request reasoning caps, a one-token logprob judge on a side GPU, and
+  gated thinking with a seeded think block (`quality/gated_think.py`, `quality/rejudge.py`).
