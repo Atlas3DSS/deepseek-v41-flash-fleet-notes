@@ -10,7 +10,7 @@ Working notes from serving DeepSeek-V4.1-Flash-1017 at its native Q8_0/MXFP4 pre
   `dsv41-kv-replicas.patch` (per-device replicas of reused KV layers: 3.9 -> 9.5 tok/s on our fleet),
   `dsv41-rpc-graph-cache.patch` (per-uid RPC graph cache), `dsv41-rpc-cache-verify.patch` (rpc tensor-cache integrity),
   `dsv41-mxfp4-e8m0-vector-scale.patch` (in-register E8M0 scale conversion in the x86 MXFP4 kernels, +30-39 % on AVX2).
-  The full branch, including cherry-picks from cliecy/llama.cpp with attribution, is `dsv41-fleet` on our llama.cpp fork.
+  The full branch, including cherry-picks from cliecy/llama.cpp with attribution, is [`dsv41-fleet` on our llama.cpp fork](https://github.com/Atlas3DSS/llama.cpp/tree/dsv41-fleet).
 - **[quality/](quality/)** — the 30-prompt set (polymer chemistry, lab technique, coding) and the collection harness we use
   to compare quants blind.
 - **[BRANCH-NOTES.md](BRANCH-NOTES.md)** — what the branch carries and who to credit.
